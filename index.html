@@ -112,6 +112,9 @@ input[type=range]:focus-visible{outline:1px dotted var(--ink)}
 .seg2{display:grid;grid-template-columns:1fr 1fr;gap:4px}
 .swap{display:none}
 #micBtn.on{color:var(--orange)}
+#chips .crate::before{content:"";display:inline-block;width:6px;height:6px;background:var(--orange);margin-right:6px;vertical-align:middle}
+.editing #chips .crate{color:var(--orange)}
+.editing #chips .crate::after{content:" ×"}
 
 /* landscape: two-thumb mode — fader on one edge, record on the other, everything else in between */
 @media (orientation:landscape) and (max-height:560px){
@@ -206,6 +209,7 @@ input[type=range]:focus-visible{outline:1px dotted var(--ink)}
         <button class="btn tiny" data-s="stab" aria-pressed="false">STAB</button>
         <button class="btn tiny" id="uploadBtn">Open files…</button>
         <button class="btn tiny" id="micBtn">● Mic</button>
+        <button class="btn tiny" id="editBtn" aria-pressed="false" hidden>Edit crate</button>
         <input type="file" id="file" accept="audio/*,.mp3,.wav,.m4a,.aif,.aiff" multiple hidden>
       </div>
       <div class="wave sunken"><canvas id="wave"></canvas></div>
@@ -344,7 +348,8 @@ async function setup(){
   samples.ahh={name:'AHH',buf:await renderAhh()};
   samples.fresh={name:'FRESH',buf:await renderFresh()};
   samples.stab={name:'STAB',buf:await renderStab()};
-  useSample(curKey);
+  await restoreCrate();
+  useSample(samples[curKey]?curKey:'ahh');
   send({motor:motorValue()});
   ready=true;updateGain();
   $('startBtn').hidden=true;status('Ready');
@@ -421,20 +426,51 @@ async function loadFile(file){
   status('Opening '+file.name+'…');
   await loadArrayBuffer(await file.arrayBuffer(),file.name.replace(/\.[^.]+$/,''));
 }
-async function loadArrayBuffer(ab,rawName){
-  let buf;
-  try{buf=await new Promise((res,rej)=>{const p=ctx.decodeAudioData(ab,res,rej);if(p&&p.then)p.then(res,rej);});}
-  catch(e){status('Could not open that file. Try mp3, wav or m4a.');return;}
+async function decodeSample(ab){
+  const buf=await new Promise((res,rej)=>{const p=ctx.decodeAudioData(ab,res,rej);if(p&&p.then)p.then(res,rej);});
   // trim leading silence so the sticker sits on the first sound
   const L=buf.getChannelData(0);let st=0;while(st<L.length&&Math.abs(L[st])<0.02)st++;st=Math.max(0,st-200);
-  const len=Math.min(L.length-st,sr*60),out=ctx.createBuffer(Math.min(2,buf.numberOfChannels),len,sr);
+  const len=Math.max(1,Math.min(L.length-st,sr*60)),out=ctx.createBuffer(Math.min(2,buf.numberOfChannels),len,sr);
   for(let c=0;c<out.numberOfChannels;c++)out.getChannelData(c).set(buf.getChannelData(c).subarray(st,st+len));
-  const name=(rawName.slice(0,7)||'MINE').toUpperCase();
-  const key='u'+Date.now();samples[key]={name,buf:out};
-  const chip=document.createElement('button');chip.className='btn tiny';chip.dataset.s=key;chip.textContent=name;
-  $('uploadBtn').before(chip);
-  useSample(key);
+  return out;
 }
+async function loadArrayBuffer(ab,rawName){
+  const raw=ab.slice(0); // decodeAudioData may detach the original
+  let out;
+  try{out=await decodeSample(ab);}catch(e){status('Could not open that file. Try mp3, wav or m4a.');return;}
+  const name=(rawName.slice(0,7)||'MINE').toUpperCase();
+  const key='c'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+  samples[key]={name,buf:out};addChip(key,name);useSample(key);
+  if(raw.byteLength>25e6){status(name+' loaded (too big to keep in the crate)');return;}
+  const ok=await crate.put({id:key,name,data:raw,added:Date.now()});
+  status(ok?name+' saved to your crate':name+' loaded (this browser would not keep it)');
+}
+function addChip(key,name){
+  const chip=document.createElement('button');chip.className='btn tiny crate';chip.dataset.s=key;chip.textContent=name;chip.setAttribute('aria-pressed','false');
+  $('uploadBtn').before(chip);$('editBtn').hidden=false;
+}
+
+// ---------- crate: your samples, kept in this browser (IndexedDB) ----------
+const crate={
+  db:null,
+  open(){if(this.db)return this.db;this.db=new Promise(res=>{try{const r=indexedDB.open('scratch-buddy',1);
+    r.onupgradeneeded=()=>r.result.createObjectStore('crate',{keyPath:'id'});r.onsuccess=()=>{r.result.onversionchange=()=>r.result.close();res(r.result);};r.onerror=()=>res(null);r.onblocked=()=>res(null);}catch(e){res(null);}});return this.db;},
+  async tx(mode,fn){const db=await this.open();if(!db)return null;return new Promise(res=>{try{const t=db.transaction('crate',mode),st=t.objectStore('crate'),r=fn(st);
+    t.oncomplete=()=>res(r&&'result' in r?r.result:true);t.onerror=t.onabort=()=>res(null);}catch(e){res(null);}});},
+  all(){return this.tx('readonly',st=>st.getAll());},
+  put(rec){return this.tx('readwrite',st=>st.put(rec)).then(r=>r!==null);},
+  del(id){return this.tx('readwrite',st=>st.delete(id));}
+};
+let crateRecs=[];
+(async()=>{const recs=await crate.all();if(!recs||!recs.length)return;
+  crateRecs=recs.sort((a,b)=>a.added-b.added);crateRecs.forEach(r=>addChip(r.id,r.name));
+  try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist();}catch(e){}
+  if(!ctx)status('Your crate: '+recs.length+' sample'+(recs.length>1?'s':'')+'. Press Start.');})();
+async function restoreCrate(){
+  for(const r of crateRecs){if(samples[r.id])continue;try{samples[r.id]={name:r.name,buf:await decodeSample(r.data.slice(0))};}catch(e){}}
+}
+$('editBtn').onclick=()=>{const on=document.body.classList.toggle('editing');$('editBtn').setAttribute('aria-pressed',on);$('editBtn').textContent=on?'Done':'Edit crate';
+  status(on?'Tap a crate sample to remove it':'Ready');};
 
 // ---------- pixel vinyl ----------
 const vinyl=$('vinyl');
@@ -486,7 +522,13 @@ $('speedBtn').onclick=()=>{speed=speed===1?1.35:1;$('speedBtn').textContent=spee
 $('revBtn').onclick=()=>{reverse=!reverse;$('revBtn').setAttribute('aria-pressed',reverse);send({motor:motorValue()});};
 $('cueSet').onclick=()=>{cueAbs=estPos();};
 $('cueGo').onclick=()=>{if(!ready)return;send({seek:cueAbs});lastPos=cueAbs;lastT=performance.now();angle=cueAbs/spr;};
-$('chips').addEventListener('click',e=>{const c=e.target.closest('[data-s]');if(!c)return;initAudio();
+$('chips').addEventListener('click',e=>{const c=e.target.closest('[data-s]');if(!c)return;
+  if(document.body.classList.contains('editing')){if(!c.classList.contains('crate'))return;const id=c.dataset.s;
+    crate.del(id);delete samples[id];crateRecs=crateRecs.filter(r=>r.id!==id);c.remove();status('Removed '+c.textContent);
+    if(curKey===id&&ready)useSample('ahh');
+    if(!document.querySelector('#chips .crate')){$('editBtn').hidden=true;document.body.classList.remove('editing');$('editBtn').setAttribute('aria-pressed','false');$('editBtn').textContent='Edit crate';}
+    return;}
+  initAudio();
   if(ready)useSample(c.dataset.s);else{curKey=c.dataset.s;document.querySelectorAll('#chips [data-s]').forEach(x=>x.setAttribute('aria-pressed',x===c));}});
 $('uploadBtn').onclick=()=>$('file').click();
 $('file').onchange=async e=>{const fs=[...e.target.files];e.target.value='';for(const f of fs)await loadFile(f);};
@@ -531,7 +573,7 @@ $('micBtn').onclick=()=>{initAudio();const go=async()=>{if(!ready)return setTime
   micRec.ondataavailable=e=>e.data.size&&ch.push(e.data);
   micRec.onstop=async()=>{const type=micRec.mimeType||mime;micRec=null;clearTimeout(micTimer);stream.getTracks().forEach(t=>t.stop());
     $('micBtn').classList.remove('on');$('micBtn').textContent='● Mic';
-    await loadArrayBuffer(await new Blob(ch,{type}).arrayBuffer(),'MIC');};
+    await loadArrayBuffer(await new Blob(ch,{type}).arrayBuffer(),'MIC '+(document.querySelectorAll('#chips .crate').length+1));};
   micRec.start();micTimer=setTimeout(()=>micRec&&micRec.stop(),10000);
   $('micBtn').classList.add('on');$('micBtn').textContent='■ Stop mic';status('Recording mic sample (max 10 s)…');};go();};
 
